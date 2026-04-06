@@ -3,6 +3,11 @@ langgraph
 langchain-openai
 langchain-core
 google-generativeai
+google-genai
 langchain-google-genai
+langchain-community
 langchain-groq
 groq
+python-dotenv
+tavily-python
+Pillow

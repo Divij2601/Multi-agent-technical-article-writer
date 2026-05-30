@@ -28,6 +28,7 @@ env/
 # ======================
 images/
 *.md
+outputs/
 
 # Keep README.md tracked
 !readme.md

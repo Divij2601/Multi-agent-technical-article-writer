@@ -6,7 +6,7 @@ import re
 from datetime import date
 from io import BytesIO
 from pathlib import Path
-from typing import Annotated, Literal, Optional, TypedDict
+from typing import Annotated, Any, Literal, Optional, TypedDict
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -117,6 +117,65 @@ class DiagramBlueprint(BaseModel):
     footer: str = ""
 
 
+class ClaimItem(BaseModel):
+    claim_id: str
+    task_id: int
+    claim_text: str
+    claim_type: Literal["current_event", "external_fact", "quantitative", "code_claim", "conceptual", "other"]
+
+
+class ClaimExtraction(BaseModel):
+    claims: list[ClaimItem] = Field(default_factory=list)
+
+
+class ClaimReport(BaseModel):
+    claim_id: str
+    task_id: int
+    claim_text: str
+    verdict: Literal["verified", "weakly_supported", "unsupported"]
+    matched_urls: list[str] = Field(default_factory=list)
+    rationale: str
+
+
+class SectionVerification(BaseModel):
+    task_id: int
+    verification_status: Literal["verified", "weakly_supported", "unsupported", "unavailable"] = "verified"
+    revision_required: bool = False
+    claim_reports: list[ClaimReport] = Field(default_factory=list)
+
+
+class CitationEntry(BaseModel):
+    claim_id: str
+    span_text: str
+    url: str
+    label: str = "Source"
+
+
+class SectionCitations(BaseModel):
+    task_id: int
+    citations: list[CitationEntry] = Field(default_factory=list)
+
+
+class QualityScore(BaseModel):
+    clarity: int = Field(..., ge=1, le=10)
+    hallucination_risk: int = Field(..., ge=1, le=10)
+    technical_depth: int = Field(..., ge=1, le=10)
+    seo_readiness: int = Field(..., ge=1, le=10)
+    redundancy: int = Field(..., ge=1, le=10)
+    overall: int = Field(..., ge=1, le=10)
+    summary: str
+    needs_revision: bool = False
+
+
+class RetryRecord(BaseModel):
+    node: str
+    scope: str
+    attempt_count: int
+    succeeded: bool
+    last_error: Optional[str] = None
+    fallback_used: Optional[str] = None
+
+
 class State(TypedDict):
     topic: str
     as_of: str
@@ -125,14 +184,22 @@ class State(TypedDict):
     needs_research: bool
     queries: list[str]
     evidence: list[EvidenceItem]
+    source_registry: dict[str, dict[str, Any]]
+    section_evidence_map: dict[str, list[dict[str, Any]]]
     plan: Optional[Plan]
     sections: Annotated[list[tuple[int, str]], operator.add]
+    section_citations: Annotated[list[dict[str, Any]], operator.add]
+    verification_reports: Annotated[list[dict[str, Any]], operator.add]
+    revision_required_sections: Annotated[list[int], operator.add]
+    retry_records: Annotated[list[dict[str, Any]], operator.add]
+    fallback_reasons: Annotated[list[dict[str, Any]], operator.add]
     merged_md: str
     md_with_placeholders: str
     image_specs: list[dict]
     final: str
     output_path: str
     image_paths: list[str]
+    quality_score: dict[str, Any]
 
 
 def _build_text_llms() -> list:
@@ -195,6 +262,43 @@ LLM_CANDIDATES = _build_text_llms()
 llm = LLM_CANDIDATES[0]
 
 
+def _add_retry_record(
+    retry_records: Optional[list[dict[str, Any]]],
+    *,
+    node: str,
+    scope: str,
+    attempt_count: int,
+    succeeded: bool,
+    last_error: Optional[str] = None,
+    fallback_used: Optional[str] = None,
+) -> None:
+    if retry_records is None:
+        return
+
+    retry_records.append(
+        RetryRecord(
+            node=node,
+            scope=scope,
+            attempt_count=attempt_count,
+            succeeded=succeeded,
+            last_error=last_error,
+            fallback_used=fallback_used,
+        ).model_dump()
+    )
+
+
+def _add_fallback_reason(
+    fallback_reasons: Optional[list[dict[str, Any]]],
+    *,
+    node: str,
+    scope: str,
+    reason: str,
+) -> None:
+    if fallback_reasons is None:
+        return
+    fallback_reasons.append({"node": node, "scope": scope, "reason": reason})
+
+
 def _message_to_text(response) -> str:
     content = getattr(response, "content", response)
     if isinstance(content, str):
@@ -210,26 +314,73 @@ def _message_to_text(response) -> str:
     return str(content).strip()
 
 
-def _invoke_text_model(messages: list, *, attempts_per_client: int = 2) -> str:
+def _invoke_text_model(
+    messages: list,
+    *,
+    node_name: str = "text_model",
+    scope: str = "global",
+    attempts_per_client: int = 2,
+    retry_records: Optional[list[dict[str, Any]]] = None,
+) -> str:
     errors: list[str] = []
     for client in LLM_CANDIDATES:
         for attempt in range(attempts_per_client):
             try:
-                return _message_to_text(client.invoke(messages))
+                text = _message_to_text(client.invoke(messages))
+                _add_retry_record(
+                    retry_records,
+                    node=node_name,
+                    scope=scope,
+                    attempt_count=attempt + 1,
+                    succeeded=True,
+                )
+                return text
             except Exception as exc:
                 errors.append(f"{client.__class__.__name__} attempt {attempt + 1}: {exc}")
+    _add_retry_record(
+        retry_records,
+        node=node_name,
+        scope=scope,
+        attempt_count=attempts_per_client,
+        succeeded=False,
+        last_error=" | ".join(errors[-4:]),
+    )
     raise RuntimeError("All configured text models failed. " + " | ".join(errors[-4:]))
 
 
-def _invoke_structured_model(schema, messages: list, *, attempts_per_client: int = 2):
+def _invoke_structured_model(
+    schema,
+    messages: list,
+    *,
+    node_name: str = "structured_model",
+    scope: str = "global",
+    attempts_per_client: int = 2,
+    retry_records: Optional[list[dict[str, Any]]] = None,
+):
     errors: list[str] = []
     for client in LLM_CANDIDATES:
         runnable = client.with_structured_output(schema)
         for attempt in range(attempts_per_client):
             try:
-                return runnable.invoke(messages)
+                result = runnable.invoke(messages)
+                _add_retry_record(
+                    retry_records,
+                    node=node_name,
+                    scope=scope,
+                    attempt_count=attempt + 1,
+                    succeeded=True,
+                )
+                return result
             except Exception as exc:
                 errors.append(f"{client.__class__.__name__} attempt {attempt + 1}: {exc}")
+    _add_retry_record(
+        retry_records,
+        node=node_name,
+        scope=scope,
+        attempt_count=attempts_per_client,
+        succeeded=False,
+        last_error=" | ".join(errors[-4:]),
+    )
     raise RuntimeError("All configured structured-output models failed. " + " | ".join(errors[-4:]))
 
 
@@ -257,6 +408,48 @@ def _count_words(text: str) -> int:
     return len(re.findall(r"\b[\w'-]+\b", text))
 
 
+def _slugify(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "item"
+
+
+def _tokenize_for_match(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]{3,}", text.lower())
+        if token not in {"with", "from", "that", "this", "into", "they", "their", "have", "about"}
+    }
+
+
+def _match_evidence_for_task(task: Task, evidence: list[EvidenceItem], *, top_k: int = 4) -> list[EvidenceItem]:
+    query_tokens = _tokenize_for_match(" ".join([task.title, task.goal, *task.bullets, " ".join(task.tags)]))
+    scored: list[tuple[int, EvidenceItem]] = []
+    for item in evidence:
+        evidence_tokens = _tokenize_for_match(" ".join([item.title, item.snippet or "", item.source or ""]))
+        overlap = len(query_tokens & evidence_tokens)
+        freshness_bonus = 1 if item.published_at else 0
+        score = overlap * 3 + freshness_bonus
+        if task.requires_citations and item.url:
+            score += 1
+        if score > 0:
+            scored.append((score, item))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    matched = [item for _, item in scored[:top_k]]
+    if matched:
+        return matched
+    return evidence[:top_k]
+
+
+def _status_rank(status: str) -> int:
+    return {"verified": 0, "weakly_supported": 1, "unsupported": 2, "unavailable": 3}.get(status, 3)
+
+
+def _score_to_overall(values: list[int]) -> int:
+    if not values:
+        return 1
+    return max(1, min(10, round(sum(values) / len(values))))
+
+
 def _clean_links(markdown_text: str, allowed_urls: set[str], allow_links: bool) -> str:
     def replace_markdown_link(match: re.Match[str]) -> str:
         label = match.group(1)
@@ -269,6 +462,14 @@ def _clean_links(markdown_text: str, allowed_urls: set[str], allow_links: bool) 
         return markdown_text
 
     return re.sub(r"https?://\S+", "", markdown_text)
+
+
+def _dedupe_citations(entries: list[CitationEntry]) -> list[CitationEntry]:
+    deduped: dict[tuple[str, str], CitationEntry] = {}
+    for entry in entries:
+        key = (entry.claim_id, entry.url)
+        deduped[key] = entry
+    return list(deduped.values())
 
 
 def _image_dimensions(size: str) -> tuple[int, int]:
@@ -392,18 +593,22 @@ If needs_research=true:
 
 def router_node(state: State) -> dict:
     topic = state["topic"]
+    retry_records: list[dict[str, Any]] = []
     decision = _invoke_structured_model(
         RouterDecision,
         [
             SystemMessage(content=ROUTER_SYSTEM),
             HumanMessage(content=f"Topic: {topic}\nAs of: {state['as_of']}"),
         ],
+        node_name="router",
+        retry_records=retry_records,
     )
 
     return {
         "needs_research": decision.needs_research,
         "mode": decision.mode,
         "queries": decision.queries,
+        "retry_records": retry_records,
     }
 
 
@@ -411,15 +616,51 @@ def route_next(state: State) -> str:
     return "research" if state["needs_research"] else "orchestrator"
 
 
-def _tavily_search(query: str, max_results: int = 4) -> list[dict]:
+def _tavily_search(
+    query: str,
+    max_results: int = 4,
+    *,
+    scope: str = "research",
+    retry_records: Optional[list[dict[str, Any]]] = None,
+    fallback_reasons: Optional[list[dict[str, Any]]] = None,
+) -> list[dict]:
     tavily_api_key = os.getenv("TAVILY_API_KEY")
     if not tavily_api_key:
+        _add_fallback_reason(fallback_reasons, node="research", scope=scope, reason="TAVILY_API_KEY missing")
         return []
 
-    try:
-        tool = TavilySearchResults(max_results=max_results)
-        results = tool.invoke({"query": query})
-    except Exception:
+    tool = TavilySearchResults(max_results=max_results)
+    last_error: Optional[str] = None
+    for attempt in range(2):
+        try:
+            results = tool.invoke({"query": query})
+            _add_retry_record(
+                retry_records,
+                node="tavily_search",
+                scope=f"{scope}:{query[:48]}",
+                attempt_count=attempt + 1,
+                succeeded=True,
+            )
+            break
+        except Exception as exc:
+            last_error = str(exc)
+            results = []
+    else:
+        _add_retry_record(
+            retry_records,
+            node="tavily_search",
+            scope=f"{scope}:{query[:48]}",
+            attempt_count=2,
+            succeeded=False,
+            last_error=last_error,
+            fallback_used="empty_results",
+        )
+        _add_fallback_reason(
+            fallback_reasons,
+            node="research",
+            scope=f"{scope}:{query[:48]}",
+            reason=f"Tavily failed, continuing with empty results: {last_error}",
+        )
         return []
 
     normalized: list[dict] = []
@@ -453,12 +694,28 @@ Rules:
 def research_node(state: State) -> dict:
     queries = (state.get("queries", []) or [])[:5]
     raw_results: list[dict] = []
+    retry_records: list[dict[str, Any]] = []
+    fallback_reasons: list[dict[str, Any]] = []
 
     for query in queries:
-        raw_results.extend(_tavily_search(query, max_results=4))
+        raw_results.extend(
+            _tavily_search(
+                query,
+                max_results=4,
+                scope="research",
+                retry_records=retry_records,
+                fallback_reasons=fallback_reasons,
+            )
+        )
 
     if not raw_results:
-        return {"evidence": []}
+        fallback_reason = (
+            "No research evidence available; continuing with empty evidence."
+            if state.get("needs_research")
+            else "No research required for this topic."
+        )
+        _add_fallback_reason(fallback_reasons, node="research", scope="global", reason=fallback_reason)
+        return {"evidence": [], "retry_records": retry_records, "fallback_reasons": fallback_reasons}
 
     compact_results: list[dict] = []
     seen_urls: set[str] = set()
@@ -485,6 +742,8 @@ def research_node(state: State) -> dict:
             SystemMessage(content=RESEARCH_SYSTEM),
             HumanMessage(content=f"Raw results:\n{compact_results}"),
         ],
+        node_name="research_synthesizer",
+        retry_records=retry_records,
     )
 
     dedup: dict[str, EvidenceItem] = {}
@@ -492,7 +751,25 @@ def research_node(state: State) -> dict:
         if item.url:
             dedup[item.url] = item
 
-    return {"evidence": list(dedup.values())}
+    return {"evidence": list(dedup.values()), "retry_records": retry_records, "fallback_reasons": fallback_reasons}
+
+
+def citation_enricher_node(state: State) -> dict:
+    evidence = state.get("evidence", []) or []
+    source_registry: dict[str, dict[str, Any]] = {}
+    fallback_reasons: list[dict[str, Any]] = []
+    for item in evidence:
+        source_registry[item.url] = item.model_dump()
+
+    if not source_registry and state.get("needs_research"):
+        _add_fallback_reason(
+            fallback_reasons,
+            node="citation_enricher",
+            scope="global",
+            reason="Citation enrichment had no evidence to normalize; worker fallback will use raw evidence.",
+        )
+
+    return {"source_registry": source_registry, "fallback_reasons": fallback_reasons}
 
 
 ORCH_SYSTEM = """You are a senior technical writer and developer advocate.
@@ -531,6 +808,7 @@ Output must strictly match the Plan schema.
 def orchestrator_node(state: State) -> dict:
     evidence = state.get("evidence", [])
     mode = state.get("mode", "closed_book")
+    retry_records: list[dict[str, Any]] = []
 
     base_prompt = (
         f"Topic: {state['topic']}\n"
@@ -547,10 +825,19 @@ def orchestrator_node(state: State) -> dict:
 
     plan: Optional[Plan] = None
     for _ in range(3):
-        plan = _invoke_structured_model(Plan, messages)
+        plan = _invoke_structured_model(
+            Plan,
+            messages,
+            node_name="orchestrator",
+            retry_records=retry_records,
+        )
         issues = _plan_issues(plan)
         if not issues:
-            return {"plan": plan}
+            section_evidence_map = {
+                str(task.id): [item.model_dump() for item in _match_evidence_for_task(task, evidence)]
+                for task in plan.tasks
+            }
+            return {"plan": plan, "section_evidence_map": section_evidence_map, "retry_records": retry_records}
 
         messages.append(
             HumanMessage(
@@ -563,26 +850,53 @@ def orchestrator_node(state: State) -> dict:
         )
 
     assert plan is not None
-    return {"plan": plan}
+    section_evidence_map = {
+        str(task.id): [item.model_dump() for item in _match_evidence_for_task(task, evidence)]
+        for task in plan.tasks
+    }
+    return {"plan": plan, "section_evidence_map": section_evidence_map, "retry_records": retry_records}
 
 
 def fanout(state: State):
     plan = state["plan"]
     assert plan is not None
+    evidence = state.get("evidence", []) or []
+    section_evidence_map = state.get("section_evidence_map", {})
 
     return [
         Send(
-            "worker",
+            "worker_pipeline",
             {
                 "task": task.model_dump(),
                 "topic": state["topic"],
                 "mode": state["mode"],
                 "plan": plan.model_dump(),
-                "evidence": [item.model_dump() for item in state.get("evidence", [])],
+                "evidence": section_evidence_map.get(str(task.id), [item.model_dump() for item in evidence]),
+                "source_registry": state.get("source_registry", {}),
             },
         )
         for task in plan.tasks
     ]
+
+
+class WorkerState(TypedDict):
+    task: dict[str, Any]
+    topic: str
+    mode: str
+    plan: dict[str, Any]
+    evidence: list[dict[str, Any]]
+    source_registry: dict[str, dict[str, Any]]
+    section_md: str
+    revised_section_md: str
+    verification: dict[str, Any]
+    section_citations_item: dict[str, Any]
+    revision_required: bool
+    revision_required_sections: Annotated[list[int], operator.add]
+    sections: Annotated[list[tuple[int, str]], operator.add]
+    verification_reports: Annotated[list[dict[str, Any]], operator.add]
+    section_citations: Annotated[list[dict[str, Any]], operator.add]
+    retry_records: Annotated[list[dict[str, Any]], operator.add]
+    fallback_reasons: Annotated[list[dict[str, Any]], operator.add]
 
 
 WORKER_SYSTEM = """You are a senior technical writer and developer advocate.
@@ -618,7 +932,110 @@ Style:
 """
 
 
-def _generate_section(task: Task, plan: Plan, topic: str, mode: str, evidence: list[EvidenceItem]) -> str:
+CLAIM_EXTRACTION_SYSTEM = """Extract only factual or externally verifiable claims from this section.
+
+Rules:
+- Ignore purely conceptual explanations unless they make a concrete real-world assertion.
+- For closed-book, evergreen sections, extract only claims that reference current tools, real-world adoption, benchmark-like statements, dates, named products, or quantitative facts.
+- Use claim_type:
+  - current_event
+  - external_fact
+  - quantitative
+  - code_claim
+  - conceptual
+  - other
+- Return only claims worth checking against external evidence.
+"""
+
+
+FACT_CHECK_SYSTEM = """You are a meticulous fact checker.
+
+Given extracted claims and an allowed evidence list, evaluate each claim using only the provided evidence URLs.
+
+Verdicts:
+- verified: explicit support in the evidence
+- weakly_supported: partially supported or indirectly supported
+- unsupported: not justified by the provided evidence
+
+Rules:
+- Never use outside knowledge.
+- Prefer explicit support.
+- Keep rationales short and precise.
+"""
+
+
+REVISION_SYSTEM = """Revise a single Markdown section to remove or soften unsupported claims.
+
+Rules:
+- Preserve the section heading and overall structure.
+- Preserve valid code blocks unless they themselves make unsupported outside-world claims.
+- Keep citations only to allowed URLs.
+- Remove unsupported claims or rewrite them into generic, clearly bounded statements.
+- If support is weak, hedge the wording rather than asserting certainty.
+- Output only the revised section in Markdown.
+"""
+
+
+QUALITY_SCORING_SYSTEM = """Score the final technical blog draft.
+
+Return a QualityScore object with 1-10 scores for:
+- clarity
+- hallucination_risk
+- technical_depth
+- seo_readiness
+- redundancy
+- overall
+
+Use low hallucination_risk scores for riskier drafts and higher scores for well-grounded drafts.
+Set needs_revision=true if the draft still feels risky, thin, repetitive, or weakly grounded.
+"""
+
+
+def _build_citation_entries(task_id: int, claim_reports: list[ClaimReport]) -> SectionCitations:
+    citations: list[CitationEntry] = []
+    for report in claim_reports:
+        if report.verdict == "unsupported":
+            continue
+        for url in report.matched_urls[:1]:
+            citations.append(
+                CitationEntry(
+                    claim_id=report.claim_id,
+                    span_text=report.claim_text[:160],
+                    url=url,
+                )
+            )
+    return SectionCitations(task_id=task_id, citations=_dedupe_citations(citations))
+
+
+def _inject_citations_into_section(markdown_text: str, section_citations: SectionCitations) -> str:
+    updated = markdown_text
+    for citation in section_citations.citations:
+        marker = f"([{citation.label}]({citation.url}))"
+        if citation.url in updated:
+            continue
+        span = citation.span_text.strip()
+        if span and span in updated:
+            updated = updated.replace(span, f"{span} {marker}", 1)
+            continue
+
+        sentence_match = re.search(r"([^.?!\n]*" + re.escape(span[:32]) + r"[^.?!\n]*[.?!])", updated, flags=re.IGNORECASE)
+        if sentence_match:
+            sentence = sentence_match.group(1)
+            updated = updated.replace(sentence, f"{sentence} {marker}", 1)
+        else:
+            updated = updated.rstrip() + f"\n\n{marker}"
+    return updated
+
+
+def _generate_section(
+    task: Task,
+    plan: Plan,
+    topic: str,
+    mode: str,
+    evidence: list[EvidenceItem],
+    *,
+    retry_records: Optional[list[dict[str, Any]]] = None,
+) -> str:
     bullets_text = "\n- " + "\n- ".join(task.bullets)
     evidence_text = "\n".join(
         f"- {item.title} | {item.url} | {item.published_at or 'date:unknown'}"
@@ -649,7 +1066,12 @@ def _generate_section(task: Task, plan: Plan, topic: str, mode: str, evidence: l
         HumanMessage(content=base_human_message),
     ]
 
-    section_md = _invoke_text_model(messages)
+    section_md = _invoke_text_model(
+        messages,
+        node_name="worker_draft",
+        scope=f"task:{task.id}",
+        retry_records=retry_records,
+    )
     min_words = max(int(task.target_words * 0.8), 150)
     allowed_urls = {item.url for item in evidence if item.url}
     allow_links = mode == "open_book" or task.requires_citations
@@ -683,21 +1105,265 @@ def _generate_section(task: Task, plan: Plan, topic: str, mode: str, evidence: l
                         + "\n".join(f"- {issue}" for issue in issues)
                     )
                 ),
-            ]
+            ],
+            node_name="worker_revision",
+            scope=f"task:{task.id}",
+            retry_records=retry_records,
         )
 
     return _clean_links(section_md, allowed_urls, allow_links)
 
 
-def worker_node(payload: dict) -> dict:
+def worker_draft_node(payload: WorkerState) -> dict:
     task = Task(**payload["task"])
     plan = Plan(**payload["plan"])
     evidence = [EvidenceItem(**item) for item in payload.get("evidence", [])]
     topic = payload["topic"]
     mode = payload.get("mode", "closed_book")
+    retry_records: list[dict[str, Any]] = []
 
-    section_md = _generate_section(task, plan, topic, mode, evidence)
-    return {"sections": [(task.id, section_md)]}
+    section_md = _generate_section(
+        task,
+        plan,
+        topic,
+        mode,
+        evidence,
+        retry_records=retry_records,
+    )
+    return {"section_md": section_md, "retry_records": retry_records}
+
+
+def fact_checker_node(payload: WorkerState) -> dict:
+    task = Task(**payload["task"])
+    mode = payload.get("mode", "closed_book")
+    evidence = [EvidenceItem(**item) for item in payload.get("evidence", [])]
+    section_md = payload["section_md"]
+    retry_records: list[dict[str, Any]] = []
+    fallback_reasons: list[dict[str, Any]] = []
+
+    if not evidence and mode != "open_book":
+        verification = SectionVerification(task_id=task.id, verification_status="verified", revision_required=False)
+        return {
+            "verification": verification.model_dump(),
+            "section_citations_item": SectionCitations(task_id=task.id).model_dump(),
+            "verification_reports": [verification.model_dump()],
+            "section_citations": [SectionCitations(task_id=task.id).model_dump()],
+            "retry_records": retry_records,
+            "fallback_reasons": fallback_reasons,
+            "revision_required_sections": [],
+            "revision_required": False,
+        }
+
+    try:
+        extraction = _invoke_structured_model(
+            ClaimExtraction,
+            [
+                SystemMessage(content=CLAIM_EXTRACTION_SYSTEM),
+                HumanMessage(
+                    content=(
+                        f"Task id: {task.id}\n"
+                        f"Mode: {mode}\n"
+                        f"Section markdown:\n{section_md}"
+                    )
+                ),
+            ],
+            node_name="claim_extractor",
+            scope=f"task:{task.id}",
+            retry_records=retry_records,
+        )
+    except Exception as exc:
+        verification = SectionVerification(task_id=task.id, verification_status="unavailable", revision_required=False)
+        _add_fallback_reason(
+            fallback_reasons,
+            node="fact_checker",
+            scope=f"task:{task.id}",
+            reason=f"Claim extraction failed; keeping original section: {exc}",
+        )
+        return {
+            "verification": verification.model_dump(),
+            "section_citations_item": SectionCitations(task_id=task.id).model_dump(),
+            "verification_reports": [verification.model_dump()],
+            "section_citations": [SectionCitations(task_id=task.id).model_dump()],
+            "retry_records": retry_records,
+            "fallback_reasons": fallback_reasons,
+            "revision_required_sections": [],
+            "revision_required": False,
+        }
+
+    claims = extraction.claims
+    if not claims:
+        verification = SectionVerification(task_id=task.id, verification_status="verified", revision_required=False)
+        return {
+            "verification": verification.model_dump(),
+            "section_citations_item": SectionCitations(task_id=task.id).model_dump(),
+            "verification_reports": [verification.model_dump()],
+            "section_citations": [SectionCitations(task_id=task.id).model_dump()],
+            "retry_records": retry_records,
+            "fallback_reasons": fallback_reasons,
+            "revision_required_sections": [],
+            "revision_required": False,
+        }
+
+    evidence_text = "\n".join(
+        f"- {item.title} | {item.url} | {item.snippet or ''} | {item.published_at or 'date:unknown'}"
+        for item in evidence
+    )
+    claim_lines = "\n".join(
+        f"- {claim.claim_id} | {claim.claim_type} | {claim.claim_text}"
+        for claim in claims
+    )
+    try:
+        claim_reports_pack = _invoke_structured_model(
+            SectionVerification,
+            [
+                SystemMessage(
+                    content=FACT_CHECK_SYSTEM
+                    + "\nReturn a SectionVerification object containing claim_reports for every extracted claim."
+                ),
+                HumanMessage(
+                    content=(
+                        f"Task id: {task.id}\n"
+                        f"Claims:\n{claim_lines}\n\n"
+                        f"Allowed evidence:\n{evidence_text}"
+                    )
+                ),
+            ],
+            node_name="fact_checker",
+            scope=f"task:{task.id}",
+            retry_records=retry_records,
+        )
+    except Exception as exc:
+        verification = SectionVerification(task_id=task.id, verification_status="unavailable", revision_required=False)
+        _add_fallback_reason(
+            fallback_reasons,
+            node="fact_checker",
+            scope=f"task:{task.id}",
+            reason=f"Fact checking failed; keeping original section: {exc}",
+        )
+        return {
+            "verification": verification.model_dump(),
+            "section_citations_item": SectionCitations(task_id=task.id).model_dump(),
+            "verification_reports": [verification.model_dump()],
+            "section_citations": [SectionCitations(task_id=task.id).model_dump()],
+            "revision_required_sections": [],
+            "retry_records": retry_records,
+            "fallback_reasons": fallback_reasons,
+            "revision_required": False,
+        }
+
+    verification = SectionVerification(
+        task_id=task.id,
+        verification_status=claim_reports_pack.verification_status,
+        revision_required=claim_reports_pack.revision_required,
+        claim_reports=claim_reports_pack.claim_reports,
+    )
+
+    if not verification.claim_reports:
+        verification.verification_status = "verified"
+        verification.revision_required = False
+    else:
+        worst = max((report.verdict for report in verification.claim_reports), key=_status_rank)
+        verification.verification_status = worst
+        verification.revision_required = worst in {"weakly_supported", "unsupported"}
+
+    section_citations = _build_citation_entries(task.id, verification.claim_reports)
+    revision_required_sections = [task.id] if verification.revision_required else []
+
+    return {
+        "verification": verification.model_dump(),
+        "section_citations_item": section_citations.model_dump(),
+        "verification_reports": [verification.model_dump()],
+        "section_citations": [section_citations.model_dump()],
+        "revision_required_sections": revision_required_sections,
+        "retry_records": retry_records,
+        "fallback_reasons": fallback_reasons,
+        "revision_required": verification.revision_required,
+    }
+
+
+def revision_agent_node(payload: WorkerState) -> dict:
+    task = Task(**payload["task"])
+    evidence = [EvidenceItem(**item) for item in payload.get("evidence", [])]
+    verification = SectionVerification(**payload.get("verification", {"task_id": task.id}))
+    section_citations = SectionCitations(**payload.get("section_citations_item", {"task_id": task.id, "citations": []}))
+    section_md = payload["section_md"]
+    retry_records: list[dict[str, Any]] = []
+    fallback_reasons: list[dict[str, Any]] = []
+
+    if not verification.revision_required:
+        final_section = _inject_citations_into_section(section_md, section_citations)
+        return {
+            "revised_section_md": final_section,
+            "sections": [(task.id, final_section)],
+            "retry_records": retry_records,
+            "fallback_reasons": fallback_reasons,
+        }
+
+    evidence_text = "\n".join(
+        f"- {item.title} | {item.url} | {item.snippet or ''}"
+        for item in evidence
+    )
+    report_text = "\n".join(
+        f"- {report.claim_text} => {report.verdict} | {', '.join(report.matched_urls) or 'no URLs'} | {report.rationale}"
+        for report in verification.claim_reports
+    )
+
+    try:
+        revised_section = _invoke_text_model(
+            [
+                SystemMessage(content=REVISION_SYSTEM),
+                HumanMessage(
+                    content=(
+                        f"Task id: {task.id}\n"
+                        f"Original section:\n{section_md}\n\n"
+                        f"Claim reports:\n{report_text}\n\n"
+                        f"Allowed evidence:\n{evidence_text}"
+                    )
+                ),
+            ],
+            node_name="revision_agent",
+            scope=f"task:{task.id}",
+            attempts_per_client=1,
+            retry_records=retry_records,
+        )
+    except Exception as exc:
+        revised_section = section_md
+        _add_fallback_reason(
+            fallback_reasons,
+            node="revision_agent",
+            scope=f"task:{task.id}",
+            reason=f"Revision failed; keeping original section: {exc}",
+        )
+
+    final_section = _inject_citations_into_section(revised_section, section_citations)
+
+    return {
+        "revised_section_md": final_section,
+        "sections": [(task.id, final_section)],
+        "retry_records": retry_records,
+        "fallback_reasons": fallback_reasons,
+    }
+
+
+def worker_pipeline_node(payload: dict) -> dict:
+    state: dict[str, Any] = dict(payload)
+    draft_out = worker_draft_node(state)  # type: ignore[arg-type]
+    state.update(draft_out)
+
+    fact_out = fact_checker_node(state)  # type: ignore[arg-type]
+    state.update(fact_out)
+
+    revision_out = revision_agent_node(state)  # type: ignore[arg-type]
+    state.update(revision_out)
+
+    return {
+        "sections": state.get("sections", []),
+        "verification_reports": state.get("verification_reports", []),
+        "section_citations": state.get("section_citations", []),
+        "revision_required_sections": state.get("revision_required_sections", []),
+        "retry_records": state.get("retry_records", []),
+        "fallback_reasons": state.get("fallback_reasons", []),
+    }
 
 
 def merge_content(state: State) -> dict:
@@ -813,6 +1479,8 @@ def decide_images(state: State) -> dict:
     assert plan is not None
 
     merged_md = state["merged_md"]
+    retry_records: list[dict[str, Any]] = []
+    fallback_reasons: list[dict[str, Any]] = []
 
     try:
         image_plan = _invoke_structured_model(
@@ -828,12 +1496,20 @@ def decide_images(state: State) -> dict:
                     )
                 ),
             ],
+            node_name="decide_images",
+            retry_records=retry_records,
         )
         md_with_placeholders = image_plan.md_with_placeholders or merged_md
         image_specs = [item.model_dump() for item in image_plan.images]
-    except Exception:
+    except Exception as exc:
         md_with_placeholders = merged_md
         image_specs = []
+        _add_fallback_reason(
+            fallback_reasons,
+            node="decide_images",
+            scope="global",
+            reason=f"Image planning failed; using default placeholder strategy: {exc}",
+        )
 
     normalized_specs = _normalize_image_specs(image_specs, state["topic"], plan)
     placeholders = [spec["placeholder"] for spec in normalized_specs]
@@ -846,10 +1522,17 @@ def decide_images(state: State) -> dict:
     return {
         "md_with_placeholders": md_with_placeholders,
         "image_specs": normalized_specs,
+        "retry_records": retry_records,
+        "fallback_reasons": fallback_reasons,
     }
 
 
-def _gemini_generate_image_bytes(prompt: str) -> bytes:
+def _gemini_generate_image_bytes(
+    prompt: str,
+    *,
+    scope: str = "image",
+    retry_records: Optional[list[dict[str, Any]]] = None,
+) -> bytes:
     from google import genai
     from google.genai import types
 
@@ -861,7 +1544,9 @@ def _gemini_generate_image_bytes(prompt: str) -> bytes:
     client = genai.Client(api_key=api_key)
 
     for model_name in DIRECT_IMAGE_MODELS:
+        attempts = 0
         try:
+            attempts += 1
             response = client.models.generate_content(
                 model=model_name,
                 contents=prompt,
@@ -871,6 +1556,14 @@ def _gemini_generate_image_bytes(prompt: str) -> bytes:
             )
         except Exception as exc:
             last_error = exc
+            _add_retry_record(
+                retry_records,
+                node="gemini_image",
+                scope=f"{scope}:{model_name}",
+                attempt_count=attempts,
+                succeeded=False,
+                last_error=str(exc),
+            )
             continue
 
         parts = getattr(response, "parts", None)
@@ -886,6 +1579,13 @@ def _gemini_generate_image_bytes(prompt: str) -> bytes:
         for part in parts:
             inline = getattr(part, "inline_data", None)
             if inline and getattr(inline, "data", None):
+                _add_retry_record(
+                    retry_records,
+                    node="gemini_image",
+                    scope=f"{scope}:{model_name}",
+                    attempt_count=max(attempts, 1),
+                    succeeded=True,
+                )
                 return inline.data
 
     if last_error:
@@ -893,7 +1593,13 @@ def _gemini_generate_image_bytes(prompt: str) -> bytes:
     raise RuntimeError("No inline image bytes were returned by the configured Gemini image models.")
 
 
-def _build_diagram_blueprint(spec: dict, topic: str, plan: Plan) -> DiagramBlueprint:
+def _build_diagram_blueprint(
+    spec: dict,
+    topic: str,
+    plan: Plan,
+    *,
+    retry_records: Optional[list[dict[str, Any]]] = None,
+) -> DiagramBlueprint:
     prompt = (
         "Create a compact blueprint for a technical diagram.\n"
         "Keep text short enough to fit in a clean PNG.\n"
@@ -917,6 +1623,9 @@ def _build_diagram_blueprint(spec: dict, topic: str, plan: Plan) -> DiagramBluep
                 ),
                 HumanMessage(content=prompt),
             ],
+            node_name="diagram_blueprint",
+            scope=_slugify(spec["filename"]),
+            retry_records=retry_records,
         )
     except Exception:
         seed_text = " ".join([spec["alt"], spec["caption"], spec["prompt"]])
@@ -943,8 +1652,15 @@ def _save_image_bytes_as_png(image_bytes: bytes, output_path: Path) -> None:
     image.save(output_path, format="PNG")
 
 
-def _render_local_diagram(spec: dict, topic: str, plan: Plan, output_path: Path) -> None:
-    blueprint = _build_diagram_blueprint(spec, topic, plan)
+def _render_local_diagram(
+    spec: dict,
+    topic: str,
+    plan: Plan,
+    output_path: Path,
+    *,
+    retry_records: Optional[list[dict[str, Any]]] = None,
+) -> None:
+    blueprint = _build_diagram_blueprint(spec, topic, plan, retry_records=retry_records)
     width, height = _image_dimensions(spec["size"])
 
     image = Image.new("RGB", (width, height), "#F7FAFC")
@@ -1074,24 +1790,45 @@ def _render_local_diagram(spec: dict, topic: str, plan: Plan, output_path: Path)
     image.save(output_path, format="PNG")
 
 
-def _create_visual_asset(spec: dict, topic: str, plan: Plan, output_path: Path) -> Path:
+def _create_visual_asset(
+    spec: dict,
+    topic: str,
+    plan: Plan,
+    output_path: Path,
+    *,
+    retry_records: Optional[list[dict[str, Any]]] = None,
+    fallback_reasons: Optional[list[dict[str, Any]]] = None,
+) -> Path:
     if output_path.exists() and not OVERWRITE_ASSETS:
         return output_path
 
     if IMAGE_MODE == "direct":
-        image_bytes = _gemini_generate_image_bytes(spec["prompt"])
+        image_bytes = _gemini_generate_image_bytes(
+            spec["prompt"],
+            scope=_slugify(spec["filename"]),
+            retry_records=retry_records,
+        )
         _save_image_bytes_as_png(image_bytes, output_path)
         return output_path
 
     if IMAGE_MODE == "auto":
         try:
-            image_bytes = _gemini_generate_image_bytes(spec["prompt"])
+            image_bytes = _gemini_generate_image_bytes(
+                spec["prompt"],
+                scope=_slugify(spec["filename"]),
+                retry_records=retry_records,
+            )
             _save_image_bytes_as_png(image_bytes, output_path)
             return output_path
-        except Exception:
-            pass
+        except Exception as exc:
+            _add_fallback_reason(
+                fallback_reasons,
+                node="image_generation",
+                scope=_slugify(spec["filename"]),
+                reason=f"Direct Gemini image generation failed; using local diagram fallback: {exc}",
+            )
 
-    _render_local_diagram(spec, topic, plan, output_path)
+    _render_local_diagram(spec, topic, plan, output_path, retry_records=retry_records)
     return output_path
 
 
@@ -1102,10 +1839,18 @@ def generate_and_place_images(state: State) -> dict:
     md = state.get("md_with_placeholders") or state["merged_md"]
     image_specs = state.get("image_specs", []) or []
     output_path = _safe_markdown_path(plan.blog_title)
+    retry_records: list[dict[str, Any]] = []
+    fallback_reasons: list[dict[str, Any]] = []
 
     if not image_specs:
         output_path.write_text(md, encoding="utf-8")
-        return {"final": md, "output_path": str(output_path), "image_paths": []}
+        return {
+            "final": md,
+            "output_path": str(output_path),
+            "image_paths": [],
+            "retry_records": retry_records,
+            "fallback_reasons": fallback_reasons,
+        }
 
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     image_paths: list[str] = []
@@ -1116,11 +1861,24 @@ def generate_and_place_images(state: State) -> dict:
         image_path = IMAGES_DIR / filename
 
         try:
-            _create_visual_asset(spec, state["topic"], plan, image_path)
+            _create_visual_asset(
+                spec,
+                state["topic"],
+                plan,
+                image_path,
+                retry_records=retry_records,
+                fallback_reasons=fallback_reasons,
+            )
             image_markdown = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
             md = md.replace(placeholder, image_markdown)
             image_paths.append(str(image_path))
         except Exception as exc:
+            _add_fallback_reason(
+                fallback_reasons,
+                node="generate_and_place_images",
+                scope=_slugify(filename),
+                reason=f"Image generation failed and markdown fallback was inserted: {exc}",
+            )
             fallback_block = (
                 f"> **[IMAGE GENERATION FAILED]** {spec.get('caption', '')}\n>\n"
                 f"> **Alt:** {spec.get('alt', '')}\n>\n"
@@ -1130,33 +1888,102 @@ def generate_and_place_images(state: State) -> dict:
             md = md.replace(placeholder, fallback_block)
 
     output_path.write_text(md, encoding="utf-8")
-    return {"final": md, "output_path": str(output_path), "image_paths": image_paths}
+    return {
+        "final": md,
+        "output_path": str(output_path),
+        "image_paths": image_paths,
+        "retry_records": retry_records,
+        "fallback_reasons": fallback_reasons,
+    }
 
 
-reducer_graph = StateGraph(State)
-reducer_graph.add_node("merge_content", merge_content)
-reducer_graph.add_node("decide_images", decide_images)
-reducer_graph.add_node("generate_and_place_images", generate_and_place_images)
-reducer_graph.add_edge(START, "merge_content")
-reducer_graph.add_edge("merge_content", "decide_images")
-reducer_graph.add_edge("decide_images", "generate_and_place_images")
-reducer_graph.add_edge("generate_and_place_images", END)
-reducer_subgraph = reducer_graph.compile()
+def quality_scoring_node(state: State) -> dict:
+    retry_records: list[dict[str, Any]] = []
+    fallback_reasons: list[dict[str, Any]] = []
+
+    try:
+        quality_score = _invoke_structured_model(
+            QualityScore,
+            [
+                SystemMessage(content=QUALITY_SCORING_SYSTEM),
+                HumanMessage(
+                    content=(
+                        f"Topic: {state['topic']}\n"
+                        f"Mode: {state.get('mode', 'closed_book')}\n"
+                        f"Verification reports: {state.get('verification_reports', [])}\n\n"
+                        f"Final markdown:\n{state['final']}"
+                    )
+                ),
+            ],
+            node_name="quality_scoring",
+            retry_records=retry_records,
+        )
+        quality_data = quality_score.model_dump()
+    except Exception as exc:
+        _add_fallback_reason(
+            fallback_reasons,
+            node="quality_scoring",
+            scope="global",
+            reason=f"Quality scoring failed; returning advisory fallback score: {exc}",
+        )
+        quality_data = QualityScore(
+            clarity=6,
+            hallucination_risk=5,
+            technical_depth=6,
+            seo_readiness=5,
+            redundancy=6,
+            overall=6,
+            summary="Quality scoring fallback was used because the evaluator failed.",
+            needs_revision=False,
+        ).model_dump()
+
+    return {
+        "quality_score": quality_data,
+        "retry_records": retry_records,
+        "fallback_reasons": fallback_reasons,
+    }
+
+
+def reducer_pipeline_node(state: State) -> dict:
+    merged = merge_content(state)
+    working_state: dict[str, Any] = dict(state)
+    working_state.update(merged)
+
+    images_plan = decide_images(working_state)  # type: ignore[arg-type]
+    working_state.update(images_plan)
+
+    image_output = generate_and_place_images(working_state)  # type: ignore[arg-type]
+    working_state.update(image_output)
+
+    return {
+        "merged_md": working_state.get("merged_md", ""),
+        "md_with_placeholders": working_state.get("md_with_placeholders", ""),
+        "image_specs": working_state.get("image_specs", []),
+        "final": working_state.get("final", ""),
+        "output_path": working_state.get("output_path", ""),
+        "image_paths": working_state.get("image_paths", []),
+        "retry_records": working_state.get("retry_records", []),
+        "fallback_reasons": working_state.get("fallback_reasons", []),
+    }
 
 
 graph = StateGraph(State)
 graph.add_node("router", router_node)
 graph.add_node("research", research_node)
+graph.add_node("citation_enricher", citation_enricher_node)
 graph.add_node("orchestrator", orchestrator_node)
-graph.add_node("worker", worker_node)
-graph.add_node("reducer", reducer_subgraph)
+graph.add_node("worker_pipeline", worker_pipeline_node)
+graph.add_node("reducer", reducer_pipeline_node)
+graph.add_node("quality_scoring", quality_scoring_node)
 
 graph.add_edge(START, "router")
 graph.add_conditional_edges("router", route_next, {"research": "research", "orchestrator": "orchestrator"})
-graph.add_edge("research", "orchestrator")
-graph.add_conditional_edges("orchestrator", fanout, ["worker"])
-graph.add_edge("worker", "reducer")
-graph.add_edge("reducer", END)
+graph.add_edge("research", "citation_enricher")
+graph.add_edge("citation_enricher", "orchestrator")
+graph.add_conditional_edges("orchestrator", fanout, ["worker_pipeline"])
+graph.add_edge("worker_pipeline", "reducer")
+graph.add_edge("reducer", "quality_scoring")
+graph.add_edge("quality_scoring", END)
 
 app = graph.compile()
 
@@ -1174,14 +2001,22 @@ def run(topic: str, as_of: Optional[str] = None) -> dict:
             "needs_research": False,
             "queries": [],
             "evidence": [],
+            "source_registry": {},
+            "section_evidence_map": {},
             "plan": None,
             "sections": [],
+            "section_citations": [],
+            "verification_reports": [],
+            "revision_required_sections": [],
+            "retry_records": [],
+            "fallback_reasons": [],
             "merged_md": "",
             "md_with_placeholders": "",
             "image_specs": [],
             "final": "",
             "output_path": "",
             "image_paths": [],
+            "quality_score": {},
         }
     )
 

@@ -293,8 +293,7 @@ Blog_writing_agent/
 │   └── main.py                # CLI entry point
 ├── outputs/runs/<run_id>/     # generated artifacts per run
 ├── tests/smoke_backend.py     # fake-engine job lifecycle test (no LLM)
-├── requirements.txt
-├── CLAUDE.md                  # engineering context & changelog
+├── requirements.txt                  
 └── readme.md
 ```
 
@@ -496,6 +495,6 @@ The smoke test injects a fast fake engine into the `JobManager`, proving the que
 <div align="center">
 
 Built with LangGraph, FastAPI, Groq, Gemini, and Tavily.
-See [`CLAUDE.md`](./CLAUDE.md) for the engineering changelog and deeper design notes.
+
 
 </div>

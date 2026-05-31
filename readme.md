@@ -91,7 +91,7 @@ The `src/` engine is self-contained and provider-agnostic. The `api/` layer is a
         ▼   enqueue job
    ┌────────────────────────────────────────────────────────────────┐
    │  JobManager  —  single worker thread  (api/jobs.py)            │
-   │  durable state  ⇄  SQLite  (outputs/jobs.db)                   │
+   │  durable state  ⇄  SQLite  (outputs/jobs.db)                  │         
    └────────────────────────────────────────────────────────────────┘
         │
         ▼   run_streaming()
@@ -483,14 +483,7 @@ The smoke test injects a fast fake engine into the `JobManager`, proving the que
 
 ---
 
-## Roadmap
 
-- [ ] Per-section progress within `worker_pipeline` (currently node-level).
-- [ ] Lighter persona stage to cut token usage.
-- [ ] Pluggable providers (OpenAI/Anthropic) behind the existing factory.
-- [ ] Optional multi-job concurrency for paid tiers.
-
----
 
 <div align="center">
 

@@ -1,6 +1,6 @@
 <div align="center">
 
-# ✍️ Blog Writing Agent
+# ✍️ Multi-Agent Research Article Writer
 
 **A production-style, research-aware content pipeline that turns a single topic into a long-form, fact-checked, SEO-ready technical blog.**
 

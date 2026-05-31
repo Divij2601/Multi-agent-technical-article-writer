@@ -100,7 +100,8 @@ def decide_images(state: BlogState) -> dict:
     retry_records: list[dict] = []
     fallback_reasons: list[dict] = []
     merged_md = state["humanized_md"] or state["merged_md"]
-    if DEFAULT_IMAGE_MODE in _IMAGE_OFF_MODES:
+    image_mode = state.get("image_mode") or DEFAULT_IMAGE_MODE
+    if image_mode in _IMAGE_OFF_MODES:
         # Text-only mode: do not plan or insert any image placeholders.
         return {"md_with_placeholders": merged_md, "image_specs": [], "retry_records": retry_records, "fallback_reasons": fallback_reasons}
     try:
@@ -216,13 +217,13 @@ def _render_local_diagram(spec: dict, topic: str, plan: Plan, output_path: Path,
     image.save(output_path, format="PNG")
 
 
-def _create_visual_asset(spec: dict, topic: str, plan: Plan, output_path: Path, *, execution_mode: str, retry_records: Optional[list[dict]] = None, fallback_reasons: Optional[list[dict]] = None) -> Path:
+def _create_visual_asset(spec: dict, topic: str, plan: Plan, output_path: Path, *, execution_mode: str, image_mode: str = DEFAULT_IMAGE_MODE, retry_records: Optional[list[dict]] = None, fallback_reasons: Optional[list[dict]] = None) -> Path:
     if output_path.exists() and not OVERWRITE_ASSETS:
         return output_path
-    if DEFAULT_IMAGE_MODE == "direct":
+    if image_mode == "direct":
         save_image_bytes_as_png(_gemini_generate_image_bytes(spec["prompt"], scope=spec["filename"], retry_records=retry_records), output_path)
         return output_path
-    if DEFAULT_IMAGE_MODE == "auto":
+    if image_mode == "auto":
         try:
             save_image_bytes_as_png(_gemini_generate_image_bytes(spec["prompt"], scope=spec["filename"], retry_records=retry_records), output_path)
             return output_path
@@ -239,6 +240,7 @@ def generate_and_place_images(state: BlogState) -> dict:
     images_dir = run_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
     md = state["md_with_placeholders"] or state["humanized_md"] or state["merged_md"]
+    image_mode = state.get("image_mode") or DEFAULT_IMAGE_MODE
     retry_records: list[dict] = []
     fallback_reasons: list[dict] = []
     image_paths: list[str] = []
@@ -246,7 +248,7 @@ def generate_and_place_images(state: BlogState) -> dict:
         filename = safe_image_filename(spec["filename"], index)
         image_path = images_dir / filename
         try:
-            _create_visual_asset(spec, state["topic"], plan, image_path, execution_mode=state["execution_mode"], retry_records=retry_records, fallback_reasons=fallback_reasons)
+            _create_visual_asset(spec, state["topic"], plan, image_path, execution_mode=state["execution_mode"], image_mode=image_mode, retry_records=retry_records, fallback_reasons=fallback_reasons)
             md = md.replace(spec["placeholder"], f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*")
             image_paths.append(str(image_path))
         except Exception as exc:

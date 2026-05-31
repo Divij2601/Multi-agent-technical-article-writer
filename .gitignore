@@ -29,6 +29,8 @@ env/
 images/
 *.md
 outputs/
+.codex/
+
 
 # Keep README.md tracked
 !readme.md

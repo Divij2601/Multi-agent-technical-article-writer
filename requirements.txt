@@ -11,3 +11,5 @@ groq
 python-dotenv
 tavily-python
 Pillow
+fastapi
+uvicorn[standard]

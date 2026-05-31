@@ -181,6 +181,7 @@ class BlogState(TypedDict):
     as_of: str
     audience_mode: str
     execution_mode: str
+    image_mode: str
     run_id: str
     run_dir: str
     mode: str

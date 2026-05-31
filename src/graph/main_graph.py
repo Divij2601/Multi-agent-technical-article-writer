@@ -19,7 +19,7 @@ from src.agents.seo_optimizer_agent import seo_optimizer_node
 from src.graph.reducer_graph import image_pipeline_node, reducer_pipeline_node
 from src.graph.state import BlogState, RunArtifact
 from src.graph.worker_graph import fanout
-from src.models.model_config import DEFAULT_AUDIENCE, DEFAULT_EXECUTION_MODE
+from src.models.model_config import DEFAULT_AUDIENCE, DEFAULT_EXECUTION_MODE, DEFAULT_IMAGE_MODE
 from src.observability.dashboard import write_dashboard
 from src.observability.metrics import summarize_metrics
 from src.observability.run_logger import write_run_log
@@ -122,54 +122,134 @@ def build_graph():
 app = build_graph()
 
 
-def run(topic: str, as_of: Optional[str] = None, audience_mode: str = DEFAULT_AUDIENCE, execution_mode: str = DEFAULT_EXECUTION_MODE) -> dict[str, Any]:
-    if as_of is None:
-        as_of = date.today().isoformat()
-    run_id, run_dir = create_run_dir()
+# Ordered list of graph nodes, used by the API/frontend to render a progress
+# timeline. "research" is conditional (only when the router asks for it).
+PIPELINE_NODES = [
+    "router",
+    "audience_adapter",
+    "research",
+    "citation_enricher",
+    "orchestrator",
+    "persona",
+    "worker_pipeline",
+    "reducer",
+    "humanizer",
+    "seo_optimizer",
+    "image_pipeline",
+    "quality_scoring",
+    "export",
+    "dashboard",
+]
+
+
+class RunCancelled(Exception):
+    """Raised by run_streaming when a caller-provided cancel check fires."""
+
+    def __init__(self, run_id: str):
+        super().__init__(f"Run {run_id} cancelled.")
+        self.run_id = run_id
+
+
+def _max_concurrency() -> int:
     # Serialize the section fan-out by default. Free-tier providers throttle on
     # tokens-per-minute (Groq) and requests-per-day (Gemini); running 7-9 writer
     # branches in parallel bursts past those limits instantly. max_concurrency=1
     # paces the pipeline so backoff in the LLM factory can ride out the windows.
     # Override with BLOG_MAX_CONCURRENCY if you have higher rate limits.
     try:
-        max_concurrency = max(1, int(os.getenv("BLOG_MAX_CONCURRENCY", "1")))
+        return max(1, int(os.getenv("BLOG_MAX_CONCURRENCY", "1")))
     except ValueError:
-        max_concurrency = 1
-    return app.invoke(
-        {
-            "topic": topic,
-            "as_of": as_of,
-            "audience_mode": audience_mode,
-            "execution_mode": execution_mode,
-            "run_id": run_id,
-            "run_dir": str(run_dir),
-            "mode": "",
-            "needs_research": False,
-            "queries": [],
-            "evidence": [],
-            "source_registry": {},
-            "section_evidence_map": {},
-            "audience_profile": {},
-            "persona_bundle": {},
-            "plan": None,
-            "sections": [],
-            "section_citations": [],
-            "verification_reports": [],
-            "revision_required_sections": [],
-            "retry_records": [],
-            "fallback_reasons": [],
-            "trace_events": [],
-            "merged_md": "",
-            "humanized_md": "",
-            "seo_metadata": {},
-            "md_with_placeholders": "",
-            "image_specs": [],
-            "final": "",
-            "output_path": "",
-            "image_paths": [],
-            "quality_score": {},
-            "metrics_summary": {},
-            "artifact_manifest": {},
-        },
-        config={"max_concurrency": max_concurrency},
-    )
+        return 1
+
+
+def _initial_state(topic: str, as_of: str, audience_mode: str, execution_mode: str, run_id: str, run_dir: Path, image_mode: str) -> dict[str, Any]:
+    return {
+        "topic": topic,
+        "as_of": as_of,
+        "audience_mode": audience_mode,
+        "execution_mode": execution_mode,
+        "image_mode": image_mode,
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "mode": "",
+        "needs_research": False,
+        "queries": [],
+        "evidence": [],
+        "source_registry": {},
+        "section_evidence_map": {},
+        "audience_profile": {},
+        "persona_bundle": {},
+        "plan": None,
+        "sections": [],
+        "section_citations": [],
+        "verification_reports": [],
+        "revision_required_sections": [],
+        "retry_records": [],
+        "fallback_reasons": [],
+        "trace_events": [],
+        "merged_md": "",
+        "humanized_md": "",
+        "seo_metadata": {},
+        "md_with_placeholders": "",
+        "image_specs": [],
+        "final": "",
+        "output_path": "",
+        "image_paths": [],
+        "quality_score": {},
+        "metrics_summary": {},
+        "artifact_manifest": {},
+    }
+
+
+def run(topic: str, as_of: Optional[str] = None, audience_mode: str = DEFAULT_AUDIENCE, execution_mode: str = DEFAULT_EXECUTION_MODE, image_mode: str = DEFAULT_IMAGE_MODE) -> dict[str, Any]:
+    if as_of is None:
+        as_of = date.today().isoformat()
+    run_id, run_dir = create_run_dir()
+    initial = _initial_state(topic, as_of, audience_mode, execution_mode, run_id, run_dir, image_mode)
+    return app.invoke(initial, config={"max_concurrency": _max_concurrency()})
+
+
+def run_streaming(
+    topic: str,
+    as_of: Optional[str] = None,
+    audience_mode: str = DEFAULT_AUDIENCE,
+    execution_mode: str = DEFAULT_EXECUTION_MODE,
+    image_mode: str = DEFAULT_IMAGE_MODE,
+    *,
+    on_event=None,
+    should_cancel=None,
+) -> dict[str, Any]:
+    """Run the pipeline while emitting node-by-node progress.
+
+    `on_event(event: dict)` is called with structured events:
+      - {"type": "started", "run_id", "run_dir"}
+      - {"type": "node_completed", "node": <name>}
+      - {"type": "finished", "run_id", "output_path"}
+    `should_cancel()` is polled between nodes; if it returns True a RunCancelled
+    is raised (best effort — the in-flight node still finishes first).
+
+    Returns the final graph state (same shape as run()).
+    """
+    if as_of is None:
+        as_of = date.today().isoformat()
+    run_id, run_dir = create_run_dir()
+
+    def emit(event: dict) -> None:
+        if on_event is not None:
+            on_event(event)
+
+    emit({"type": "started", "run_id": run_id, "run_dir": str(run_dir)})
+    initial = _initial_state(topic, as_of, audience_mode, execution_mode, run_id, run_dir, image_mode)
+    final_state: dict[str, Any] = initial
+    # Stream both node-completion updates (for progress) and full state values
+    # (so the last value is the complete final state, like invoke()).
+    for mode, chunk in app.stream(initial, config={"max_concurrency": _max_concurrency()}, stream_mode=["updates", "values"]):
+        if mode == "updates":
+            for node_name in chunk:
+                emit({"type": "node_completed", "node": node_name})
+        elif mode == "values":
+            final_state = chunk
+        if should_cancel is not None and should_cancel():
+            raise RunCancelled(run_id)
+    emit({"type": "finished", "run_id": run_id, "output_path": final_state.get("output_path", "")})
+    return final_state

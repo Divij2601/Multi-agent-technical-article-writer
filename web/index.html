@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Blog Writing Agent</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>✍️</text></svg>" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#/new">
+        <span class="brand-mark">✍️</span>
+        <span class="brand-text">Blog Writing Agent</span>
+      </a>
+      <nav class="nav">
+        <a class="nav-link" data-route="new" href="#/new">New Blog</a>
+        <a class="nav-link" data-route="history" href="#/history">History</a>
+      </nav>
+      <div class="health" id="health" title="Backend status">
+        <span class="health-dot" id="health-dot"></span>
+        <span id="health-text">connecting…</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container" id="view">
+    <!-- views are rendered here by app.js -->
+  </main>
+
+  <!-- ===== Templates ===== -->
+
+  <template id="tpl-new">
+    <section class="hero">
+      <h1>Generate a long-form technical blog</h1>
+      <p class="muted">Research-aware drafting, multi-section planning, fact-checking, SEO, and quality scoring — from a single topic.</p>
+    </section>
+    <form class="card form" id="blog-form" autocomplete="off">
+      <label class="field">
+        <span class="field-label">Topic</span>
+        <textarea name="topic" rows="2" required minlength="4" maxlength="300"
+          placeholder="e.g. Retrieval-Augmented Generation in Production: Architecture, Pitfalls, and Cost"></textarea>
+        <span class="field-hint">Be specific. A focused, scoped topic produces a much stronger article.</span>
+      </label>
+
+      <div class="grid">
+        <label class="field">
+          <span class="field-label">Audience</span>
+          <select name="audience_mode" id="sel-audience"></select>
+        </label>
+        <label class="field">
+          <span class="field-label">Execution mode</span>
+          <select name="execution_mode" id="sel-execution"></select>
+          <span class="field-hint">Quality favors stronger models; budget favors cheaper/faster.</span>
+        </label>
+        <label class="field">
+          <span class="field-label">Images</span>
+          <select name="image_mode" id="sel-image"></select>
+          <span class="field-hint">“off” = clean text-only (recommended).</span>
+        </label>
+        <label class="field">
+          <span class="field-label">As of date <span class="optional">(optional)</span></span>
+          <input type="date" name="as_of" />
+        </label>
+      </div>
+
+      <div class="callout">
+        <strong>Heads up:</strong> generation runs one blog at a time and is paced by provider rate limits,
+        so a full run can take many minutes. You can leave this page — the job keeps running and shows up in History.
+      </div>
+
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary" id="submit-btn">Generate blog</button>
+        <span class="form-error" id="form-error"></span>
+      </div>
+    </form>
+  </template>
+
+  <template id="tpl-generation">
+    <section class="card">
+      <div class="result-head">
+        <div>
+          <div class="eyebrow">Generating</div>
+          <h1 id="gen-topic">…</h1>
+        </div>
+        <div class="result-meta">
+          <span class="badge" id="gen-status">queued</span>
+          <span class="timer" id="gen-timer">0:00</span>
+        </div>
+      </div>
+
+      <div class="progress-bar"><div class="progress-fill" id="gen-fill"></div></div>
+      <div class="progress-percent"><span id="gen-percent">0</span>% &middot; <span id="gen-current">waiting to start…</span></div>
+
+      <ol class="timeline" id="gen-timeline"></ol>
+
+      <div class="form-actions">
+        <button class="btn btn-danger" id="cancel-btn">Cancel</button>
+        <a class="btn btn-ghost" href="#/history">Back to history</a>
+        <span class="form-error" id="gen-error"></span>
+      </div>
+    </section>
+  </template>
+
+  <template id="tpl-result">
+    <section class="card">
+      <div class="result-head">
+        <div>
+          <div class="eyebrow">Finished blog</div>
+          <h1 id="res-topic">…</h1>
+          <div class="res-stats" id="res-stats"></div>
+        </div>
+        <div class="result-actions">
+          <button class="btn btn-primary" id="download-btn">⬇ Download .md</button>
+          <button class="btn btn-ghost" id="copy-btn">Copy markdown</button>
+          <a class="btn btn-ghost" id="dashboard-link" target="_blank" rel="noopener">Dashboard ↗</a>
+        </div>
+      </div>
+
+      <div class="tabs" id="res-tabs">
+        <button class="tab is-active" data-tab="blog">Blog</button>
+        <button class="tab" data-tab="seo">SEO</button>
+        <button class="tab" data-tab="quality">Quality</button>
+        <button class="tab" data-tab="images">Images</button>
+      </div>
+
+      <div class="tab-panel is-active" data-panel="blog">
+        <article class="markdown" id="res-markdown"></article>
+      </div>
+      <div class="tab-panel" data-panel="seo">
+        <div id="res-seo"></div>
+      </div>
+      <div class="tab-panel" data-panel="quality">
+        <div id="res-quality"></div>
+      </div>
+      <div class="tab-panel" data-panel="images">
+        <div id="res-images" class="gallery"></div>
+      </div>
+    </section>
+  </template>
+
+  <template id="tpl-history">
+    <section class="hero hero-row">
+      <div>
+        <h1>History</h1>
+        <p class="muted">Every generation run, newest first.</p>
+      </div>
+      <button class="btn btn-ghost" id="refresh-history">↻ Refresh</button>
+    </section>
+    <div class="card table-card">
+      <table class="table">
+        <thead>
+          <tr><th>Topic</th><th>Audience</th><th>Status</th><th>Words</th><th>Quality</th><th>Created</th></tr>
+        </thead>
+        <tbody id="history-body"></tbody>
+      </table>
+      <div class="empty" id="history-empty" hidden>No runs yet. Start one from <a href="#/new">New Blog</a>.</div>
+    </div>
+  </template>
+
+  <script src="/markdown.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

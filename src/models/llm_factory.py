@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -15,6 +17,53 @@ from .model_config import (
 )
 
 
+# Output ceilings. Kept moderate so a single request stays well under Groq's
+# free-tier 12k tokens/minute window (a ~650-word section is only ~900 tokens;
+# 3072 is ample headroom without inflating the per-request rate-limit cost).
+_SYNTHESIS_MAX_TOKENS = 3072
+_EVAL_MAX_TOKENS = 1536
+
+# Rate-limit handling. Groq free tier throttles on tokens-per-minute and returns
+# a "try again in Ns" hint; Gemini returns a 'retryDelay'. We honor those hints
+# (capped) and retry the same provider several times before falling through.
+_RATE_LIMIT_HINTS = ("rate_limit", "rate limit", "resource_exhausted", "tokens per minute", " 429", "429 ")
+_MAX_BACKOFF_SECONDS = 20.0
+
+
+def _is_rate_limited(message: str) -> bool:
+    low = message.lower()
+    return any(hint in low for hint in _RATE_LIMIT_HINTS)
+
+
+def _suggested_backoff(message: str, attempt: int) -> float:
+    low = message.lower()
+    for pattern in (r"try again in ([\d.]+)\s*s", r"please retry in ([\d.]+)s", r"retry in ([\d.]+)\s*s", r"retrydelay'?:?\s*'?([\d.]+)s"):
+        match = re.search(pattern, low)
+        if match:
+            try:
+                return min(float(match.group(1)) + 1.0, _MAX_BACKOFF_SECONDS)
+            except ValueError:
+                break
+    return min(2.0 * (2 ** attempt), _MAX_BACKOFF_SECONDS)
+
+
+def _groq_client(model: str, temperature: float, max_tokens: int):
+    from langchain_groq import ChatGroq
+
+    return ChatGroq(model=model, temperature=temperature, max_tokens=max_tokens)
+
+
+def _gemini_client(model: str, temperature: float, max_tokens: int, api_key: str):
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    return ChatGoogleGenerativeAI(
+        model=model,
+        temperature=temperature,
+        google_api_key=api_key,
+        max_output_tokens=max_tokens,
+    )
+
+
 def _build_clients(profile: str) -> list[Any]:
     import os
 
@@ -22,71 +71,36 @@ def _build_clients(profile: str) -> list[Any]:
     groq_api_key = os.getenv("GROQ_API_KEY")
     clients: list[Any] = []
 
+    # Provider ordering note:
+    # Groq is the PRIMARY text provider. Gemini's free tier is capped at ~20
+    # requests/day, which the parallel section fan-out exhausts almost instantly
+    # (see CLAUDE.md). Gemini is kept only as a secondary fallback so a single
+    # run never collapses when one provider is rate-limited.
+
     if profile == "fast_eval":
         if groq_api_key:
-            from langchain_groq import ChatGroq
-
-            clients.append(ChatGroq(model=DEFAULT_FAST_GROQ_MODEL, temperature=0.2))
+            clients.append(_groq_client(DEFAULT_FAST_GROQ_MODEL, 0.2, _EVAL_MAX_TOKENS))
         if google_api_key:
-            from langchain_google_genai import ChatGoogleGenerativeAI
-
-            clients.append(
-                ChatGoogleGenerativeAI(
-                    model=DEFAULT_GEMINI_EVAL_MODEL,
-                    temperature=0.2,
-                    google_api_key=google_api_key,
-                )
-            )
+            clients.append(_gemini_client(DEFAULT_GEMINI_EVAL_MODEL, 0.2, _EVAL_MAX_TOKENS, google_api_key))
         return clients
 
     if profile == "balanced_eval":
-        if google_api_key:
-            from langchain_google_genai import ChatGoogleGenerativeAI
-
-            clients.append(
-                ChatGoogleGenerativeAI(
-                    model=DEFAULT_GEMINI_EVAL_MODEL,
-                    temperature=0.2,
-                    google_api_key=google_api_key,
-                )
-            )
+        # Use the small/fast model first for evaluation-style tasks (claim
+        # extraction, fact-check, scoring, SEO). This conserves the scarce
+        # 70B tokens-per-minute budget for actual writing/synthesis.
         if groq_api_key:
-            from langchain_groq import ChatGroq
-
-            clients.append(ChatGroq(model=DEFAULT_FAST_GROQ_MODEL, temperature=0.2))
+            clients.append(_groq_client(DEFAULT_FAST_GROQ_MODEL, 0.2, _EVAL_MAX_TOKENS))
+        if google_api_key:
+            clients.append(_gemini_client(DEFAULT_GEMINI_EVAL_MODEL, 0.2, _EVAL_MAX_TOKENS, google_api_key))
+        if groq_api_key:
+            clients.append(_groq_client(DEFAULT_GROQ_TEXT_MODEL, 0.2, _EVAL_MAX_TOKENS))
         return clients
 
-    if profile == "quality_synthesis":
-        if google_api_key:
-            from langchain_google_genai import ChatGoogleGenerativeAI
-
-            clients.append(
-                ChatGoogleGenerativeAI(
-                    model=DEFAULT_GEMINI_TEXT_MODEL,
-                    temperature=0.3,
-                    google_api_key=google_api_key,
-                )
-            )
-        if groq_api_key:
-            from langchain_groq import ChatGroq
-
-            clients.append(ChatGroq(model=DEFAULT_GROQ_TEXT_MODEL, temperature=0.3))
-        return clients
-
+    # quality_synthesis and balanced_synthesis (default): strongest writers first.
     if groq_api_key:
-        from langchain_groq import ChatGroq
-
-        clients.append(ChatGroq(model=DEFAULT_GROQ_TEXT_MODEL, temperature=0.3))
+        clients.append(_groq_client(DEFAULT_GROQ_TEXT_MODEL, 0.4, _SYNTHESIS_MAX_TOKENS))
     if google_api_key:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-
-        clients.append(
-            ChatGoogleGenerativeAI(
-                model=DEFAULT_GEMINI_TEXT_MODEL,
-                temperature=0.3,
-                google_api_key=google_api_key,
-            )
-        )
+        clients.append(_gemini_client(DEFAULT_GEMINI_TEXT_MODEL, 0.4, _SYNTHESIS_MAX_TOKENS, google_api_key))
     return clients
 
 
@@ -114,40 +128,47 @@ def response_to_text(response: Any) -> str:
     return str(content).strip()
 
 
+def _attempt_loop(invoke_one, task_kind: str, execution_mode: str | None, attempts_per_client: int, what: str) -> tuple[Any, list[dict[str, Any]]]:
+    """Try each client `attempts_per_client` times, honoring rate-limit backoff.
+
+    `invoke_one(client)` performs a single call and returns its result. Raises
+    RuntimeError with the last errors if every client/attempt is exhausted.
+    """
+    records: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for client in get_clients(task_kind, execution_mode):
+        provider = client.__class__.__name__
+        for attempt in range(attempts_per_client):
+            try:
+                result = invoke_one(client)
+                records.append({"provider": provider, "task_kind": task_kind, "attempt": attempt + 1, "succeeded": True})
+                return result, records
+            except Exception as exc:
+                message = str(exc)
+                errors.append(f"{provider} attempt {attempt + 1}: {message}")
+                records.append({"provider": provider, "task_kind": task_kind, "attempt": attempt + 1, "succeeded": False, "error": message})
+                # If throttled and we still have attempts left on this client,
+                # wait out the suggested window and retry the SAME provider —
+                # the alternate provider is often also exhausted.
+                if attempt < attempts_per_client - 1 and _is_rate_limited(message):
+                    time.sleep(_suggested_backoff(message, attempt))
+    raise RuntimeError(f"All configured {what} models failed. " + " | ".join(errors[-4:]))
+
+
 def invoke_text(
     messages: Sequence[BaseMessage],
     *,
     task_kind: str,
     execution_mode: str | None = None,
-    attempts_per_client: int = 2,
+    attempts_per_client: int = 4,
 ) -> tuple[str, list[dict[str, Any]]]:
-    records: list[dict[str, Any]] = []
-    errors: list[str] = []
-    for client in get_clients(task_kind, execution_mode):
-        for attempt in range(attempts_per_client):
-            try:
-                text = response_to_text(client.invoke(list(messages)))
-                records.append(
-                    {
-                        "provider": client.__class__.__name__,
-                        "task_kind": task_kind,
-                        "attempt": attempt + 1,
-                        "succeeded": True,
-                    }
-                )
-                return text, records
-            except Exception as exc:
-                errors.append(f"{client.__class__.__name__} attempt {attempt + 1}: {exc}")
-                records.append(
-                    {
-                        "provider": client.__class__.__name__,
-                        "task_kind": task_kind,
-                        "attempt": attempt + 1,
-                        "succeeded": False,
-                        "error": str(exc),
-                    }
-                )
-    raise RuntimeError("All configured text models failed. " + " | ".join(errors[-4:]))
+    return _attempt_loop(
+        lambda client: response_to_text(client.invoke(list(messages))),
+        task_kind,
+        execution_mode,
+        attempts_per_client,
+        "text",
+    )
 
 
 def invoke_structured(
@@ -156,33 +177,12 @@ def invoke_structured(
     *,
     task_kind: str,
     execution_mode: str | None = None,
-    attempts_per_client: int = 2,
+    attempts_per_client: int = 4,
 ) -> tuple[Any, list[dict[str, Any]]]:
-    records: list[dict[str, Any]] = []
-    errors: list[str] = []
-    for client in get_clients(task_kind, execution_mode):
-        runnable = client.with_structured_output(schema)
-        for attempt in range(attempts_per_client):
-            try:
-                result = runnable.invoke(list(messages))
-                records.append(
-                    {
-                        "provider": client.__class__.__name__,
-                        "task_kind": task_kind,
-                        "attempt": attempt + 1,
-                        "succeeded": True,
-                    }
-                )
-                return result, records
-            except Exception as exc:
-                errors.append(f"{client.__class__.__name__} attempt {attempt + 1}: {exc}")
-                records.append(
-                    {
-                        "provider": client.__class__.__name__,
-                        "task_kind": task_kind,
-                        "attempt": attempt + 1,
-                        "succeeded": False,
-                        "error": str(exc),
-                    }
-                )
-    raise RuntimeError("All configured structured-output models failed. " + " | ".join(errors[-4:]))
+    return _attempt_loop(
+        lambda client: client.with_structured_output(schema).invoke(list(messages)),
+        task_kind,
+        execution_mode,
+        attempts_per_client,
+        "structured-output",
+    )

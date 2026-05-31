@@ -15,10 +15,15 @@ RUNS_DIRNAME = "runs"
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
 
+# Depth targets. Tuned for substantial long-form output (~3500-5000 words).
+# Per-section guidance (400-700 words) lives in the planner prompt and the
+# Task schema description; these bounds are the plan-level validation gate.
 MIN_SECTION_COUNT = 7
-MAX_SECTION_COUNT = 8
-MIN_TOTAL_TARGET_WORDS = 1800
-MAX_TOTAL_TARGET_WORDS = 3200
+MAX_SECTION_COUNT = 9
+MIN_TOTAL_TARGET_WORDS = 3500
+MAX_TOTAL_TARGET_WORDS = 5200
+MIN_SECTION_TARGET_WORDS = 350
+MAX_SECTION_TARGET_WORDS = 750
 TARGET_IMAGE_COUNT = 3
 
 DEFAULT_GEMINI_TEXT_MODEL = os.getenv("BLOG_GEMINI_MODEL", "gemini-2.5-flash")

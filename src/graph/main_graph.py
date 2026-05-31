@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import date
 from pathlib import Path
 from typing import Any, Optional
@@ -125,6 +126,15 @@ def run(topic: str, as_of: Optional[str] = None, audience_mode: str = DEFAULT_AU
     if as_of is None:
         as_of = date.today().isoformat()
     run_id, run_dir = create_run_dir()
+    # Serialize the section fan-out by default. Free-tier providers throttle on
+    # tokens-per-minute (Groq) and requests-per-day (Gemini); running 7-9 writer
+    # branches in parallel bursts past those limits instantly. max_concurrency=1
+    # paces the pipeline so backoff in the LLM factory can ride out the windows.
+    # Override with BLOG_MAX_CONCURRENCY if you have higher rate limits.
+    try:
+        max_concurrency = max(1, int(os.getenv("BLOG_MAX_CONCURRENCY", "1")))
+    except ValueError:
+        max_concurrency = 1
     return app.invoke(
         {
             "topic": topic,
@@ -160,5 +170,6 @@ def run(topic: str, as_of: Optional[str] = None, audience_mode: str = DEFAULT_AU
             "quality_score": {},
             "metrics_summary": {},
             "artifact_manifest": {},
-        }
+        },
+        config={"max_concurrency": max_concurrency},
     )

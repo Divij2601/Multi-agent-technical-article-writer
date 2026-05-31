@@ -5,7 +5,12 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from src.graph.state import BlogState
 from src.models.llm_factory import invoke_text
 from src.prompts.writer_prompts import HUMANIZER_SYSTEM
+from src.utils.markdown_utils import count_words
 from src.utils.retry_utils import add_fallback_reason, add_retry_record
+
+# If the polish pass returns less than this fraction of the original word count,
+# assume it summarized/truncated the document and keep the un-humanized draft.
+_MIN_RETENTION_RATIO = 0.7
 
 
 def humanizer_node(state: BlogState) -> dict:
@@ -23,7 +28,19 @@ def humanizer_node(state: BlogState) -> dict:
         )
         for record in llm_records:
             add_retry_record(retry_records, node="humanizer", scope=record["provider"], attempt_count=record["attempt"], succeeded=record["succeeded"], last_error=record.get("error"))
-        humanized_md = humanized_text
+        original_words = count_words(merged_md)
+        humanized_words = count_words(humanized_text)
+        if original_words and humanized_words < original_words * _MIN_RETENTION_RATIO:
+            # The polish pass compressed the article — keep the full merged draft.
+            humanized_md = merged_md
+            add_fallback_reason(
+                fallback_reasons,
+                node="humanizer",
+                scope="global",
+                reason=f"Humanizer output lost too much content ({humanized_words}/{original_words} words); kept merged draft.",
+            )
+        else:
+            humanized_md = humanized_text
     except Exception as exc:
         humanized_md = merged_md
         add_fallback_reason(fallback_reasons, node="humanizer", scope="global", reason=f"Humanizer failed; using merged markdown: {exc}")

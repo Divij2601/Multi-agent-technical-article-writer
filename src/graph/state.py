@@ -10,8 +10,8 @@ class Task(BaseModel):
     id: int
     title: str
     goal: str = Field(..., description="What the reader should understand or be able to do after this section.")
-    bullets: list[str] = Field(..., min_length=3, max_length=6)
-    target_words: int = Field(..., description="Target word count for this section (160-500).")
+    bullets: list[str] = Field(..., min_length=3, max_length=7)
+    target_words: int = Field(..., description="Target word count for this section (350-750). Aim high; sections must be substantial, not summaries.")
     tags: list[str] = Field(default_factory=list)
     requires_research: bool = False
     requires_citations: bool = False
@@ -63,7 +63,7 @@ class GlobalImagePlan(BaseModel):
 class DiagramBlueprint(BaseModel):
     title: str
     subtitle: str = ""
-    steps: list[str] = Field(default_factory=list, min_length=3, max_length=5)
+    steps: list[str] = Field(default_factory=list, min_length=3, max_length=7)
     callouts: list[str] = Field(default_factory=list, max_length=3)
     footer: str = ""
 

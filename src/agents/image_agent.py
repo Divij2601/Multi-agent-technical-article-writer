@@ -90,12 +90,19 @@ def _normalize_image_specs(image_specs: list[dict], topic: str, plan: Plan) -> l
     return normalized
 
 
+# Image modes that skip generation entirely and keep the text output clean.
+_IMAGE_OFF_MODES = {"off", "none", "skip", "disabled", "text_only"}
+
+
 def decide_images(state: BlogState) -> dict:
     plan = state["plan"]
     assert plan is not None
     retry_records: list[dict] = []
     fallback_reasons: list[dict] = []
     merged_md = state["humanized_md"] or state["merged_md"]
+    if DEFAULT_IMAGE_MODE in _IMAGE_OFF_MODES:
+        # Text-only mode: do not plan or insert any image placeholders.
+        return {"md_with_placeholders": merged_md, "image_specs": [], "retry_records": retry_records, "fallback_reasons": fallback_reasons}
     try:
         image_plan, llm_records = invoke_structured(
             GlobalImagePlan,
@@ -243,6 +250,10 @@ def generate_and_place_images(state: BlogState) -> dict:
             md = md.replace(spec["placeholder"], f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*")
             image_paths.append(str(image_path))
         except Exception as exc:
-            add_fallback_reason(fallback_reasons, node="generate_and_place_images", scope=filename, reason=f"Image generation failed and markdown fallback was inserted: {exc}")
-            md = md.replace(spec["placeholder"], f"> **[IMAGE GENERATION FAILED]** {spec.get('caption','')}\n>\n> **Prompt:** {spec.get('prompt','')}\n>\n> **Error:** {exc}\n")
+            # Image generation is non-critical. On failure, remove the placeholder
+            # cleanly so the TEXT output is never polluted by error dumps. The
+            # failure is recorded in telemetry (run log / dashboard) instead.
+            add_fallback_reason(fallback_reasons, node="generate_and_place_images", scope=filename, reason=f"Image generation failed; placeholder removed to keep text clean: {exc}")
+            md = md.replace(spec["placeholder"], "")
+    md = re.sub(r"\n{3,}", "\n\n", md).strip() + "\n"
     return {"final": md, "image_paths": image_paths, "retry_records": retry_records, "fallback_reasons": fallback_reasons}

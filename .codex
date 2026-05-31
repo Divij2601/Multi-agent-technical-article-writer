@@ -1,0 +1,368 @@
+# Blog Writing Agent Project Context
+
+## What We Are Building
+
+This repository contains a modular AI blog generation system built on LangGraph.
+
+Its job is to take a topic and produce a strong long-form technical blog post with:
+
+- research-aware writing when the topic needs external information,
+- structured multi-section planning,
+- section-by-section drafting,
+- fact checking and auto-revision,
+- inline citations,
+- optional technical images,
+- humanization and audience adaptation,
+- SEO metadata,
+- run telemetry and a lightweight dashboard.
+
+The current direction is to make this a production-style content pipeline instead of a single experimental script.
+
+## Main Goal
+
+The active goal for this codebase is the full implementation of:
+
+- Phase 2
+- Multi-persona writing
+- Audience adaptation
+- Humanization
+
+- Phase 3
+- SEO optimization
+- Observability dashboard
+- Cost optimization
+
+This has been implemented in the refactored architecture under `src/`.
+
+## What We Have Already Done
+
+### Phase 1
+
+Implemented:
+
+- research routing with Tavily-backed evidence gathering,
+- evidence normalization,
+- section-level citation enrichment,
+- per-section fact checking,
+- auto-revision for weak or unsupported claims,
+- quality scoring,
+- retry and fallback metadata.
+
+### Phase 2
+
+Implemented:
+
+- multi-persona reasoning with optimistic, critical, and neutral perspectives,
+- audience adaptation using explicit audience profiles,
+- humanization as a post-drafting polish stage.
+
+### Phase 3
+
+Implemented:
+
+- SEO metadata generation,
+- observability tracing and dashboard artifact generation,
+- model routing policy for cost and latency optimization.
+
+### Refactor
+
+The old monolithic file has been replaced by a modular architecture.
+
+- `src/research_plus_image_blog.py` is now a compatibility wrapper.
+- `src/main.py` is the main entry point.
+- `src/graph/main_graph.py` builds and runs the LangGraph workflow.
+
+## High-Level Architecture
+
+The system is organized into clear layers:
+
+### `src/agents/`
+
+Each file owns one responsibility:
+
+- `router_agent.py`
+  Decides whether the topic is closed-book, hybrid, or open-book.
+
+- `audience_adapter_agent.py`
+  Converts an audience mode like `beginner`, `engineer`, or `executive` into writing constraints.
+
+- `research_agent.py`
+  Performs Tavily research and citation enrichment.
+
+- `planner_agent.py`
+  Creates the 7-8 section blog outline and section tasks.
+
+- `persona_agents.py`
+  Generates optimistic, critical, and neutral viewpoints, then synthesizes them into a writing brief.
+
+- `section_writer_agent.py`
+  Drafts individual sections using plan context, audience context, citations, and persona guidance.
+
+- `fact_checker_agent.py`
+  Extracts claims and verifies them against allowed evidence.
+
+- `revision_agent.py`
+  Revises sections that contain weakly supported or unsupported claims.
+
+- `humanizer_agent.py`
+  Makes the final draft feel less templated and more natural while preserving structure and meaning.
+
+- `seo_optimizer_agent.py`
+  Produces SEO metadata like title, description, slug, keywords, and FAQ content.
+
+- `quality_scorer_agent.py`
+  Scores the final draft for clarity, depth, redundancy, hallucination risk, and SEO readiness.
+
+- `image_agent.py`
+  Plans and generates visual assets or diagrams and inserts them into the markdown.
+
+### `src/graph/`
+
+Owns orchestration and state:
+
+- `state.py`
+  Defines all major Pydantic data models and the full LangGraph state shape.
+
+- `main_graph.py`
+  Wires the full pipeline together.
+
+- `worker_graph.py`
+  Handles section fanout behavior.
+
+- `reducer_graph.py`
+  Merges sections and runs image-related post-processing stages.
+
+### `src/models/`
+
+Owns model/provider selection:
+
+- `llm_factory.py`
+  Centralized LLM invocation and provider fallback.
+
+- `latency_optimizer.py`
+  Chooses model profiles based on task kind and execution mode.
+
+- `capability_matrix.py`
+  Encodes which models are appropriate for which kinds of tasks.
+
+- `model_config.py`
+  Holds defaults for audience and execution modes plus model names.
+
+### `src/prompts/`
+
+Stores prompt templates grouped by purpose:
+
+- router
+- planner
+- writer
+- verification
+- scoring
+- SEO
+
+### `src/utils/`
+
+Reusable deterministic helpers:
+
+- retry helpers,
+- markdown helpers,
+- evidence helpers,
+- claim helpers,
+- image helpers,
+- logging helpers.
+
+### `src/observability/`
+
+Telemetry and reporting:
+
+- `tracing.py`
+  Wraps nodes and records start/end events.
+
+- `metrics.py`
+  Summarizes retries, timing, and fallbacks.
+
+- `run_logger.py`
+  Writes structured run logs.
+
+- `dashboard.py`
+  Builds a lightweight HTML dashboard artifact for each run.
+
+### `src/outputs/`
+
+Owns persistent artifacts:
+
+- run directory creation,
+- markdown writing,
+- SEO metadata writing,
+- artifact manifest information.
+
+## End-to-End Flow
+
+The current pipeline is:
+
+1. `router`
+2. `audience_adapter`
+3. `research` if needed
+4. `citation_enricher`
+5. `orchestrator`
+6. `persona`
+7. `worker_pipeline`
+8. `reducer`
+9. `humanizer`
+10. `seo_optimizer`
+11. `image_pipeline`
+12. `quality_scoring`
+13. `export`
+14. `dashboard`
+
+In practical terms:
+
+1. The topic is analyzed.
+2. The system decides whether external research is needed.
+3. If needed, Tavily evidence is collected.
+4. Evidence is normalized and mapped to sections.
+5. A detailed blog plan is generated.
+6. Persona agents debate and synthesize a stronger writing brief.
+7. Sections are drafted one by one.
+8. Claims are checked and revised if needed.
+9. All sections are merged into one article.
+10. The blog is humanized.
+11. SEO metadata is created.
+12. Images or diagrams are inserted.
+13. Final quality scoring is produced.
+14. Output files and run telemetry are saved.
+
+## State Model
+
+The main state object is `BlogState` in `src/graph/state.py`.
+
+Important parts of state include:
+
+- topic and date context,
+- audience mode and execution mode,
+- research mode and queries,
+- evidence and source registry,
+- section evidence mapping,
+- audience profile,
+- persona bundle,
+- plan and section outputs,
+- citations and verification reports,
+- retry records and fallback reasons,
+- trace events,
+- SEO metadata,
+- image specs and image paths,
+- final markdown,
+- quality score,
+- artifact manifest.
+
+This state is the shared contract across the whole graph.
+
+## Cost Optimization Strategy
+
+Cost and latency optimization are built into model routing.
+
+The system does not use one model for everything.
+
+Instead:
+
+- cheaper or faster models are preferred for evaluation-style tasks,
+- stronger synthesis-oriented models are preferred for planning and writing,
+- provider fallback is centralized,
+- execution modes can be used to bias the routing policy.
+
+Examples of task-specific routing:
+
+- routing and evaluation tasks use fast evaluation profiles,
+- planning and section writing use higher-quality synthesis profiles,
+- humanization, SEO, and scoring can use lighter evaluation-oriented choices when appropriate.
+
+## Outputs
+
+Each run creates artifacts under `outputs/runs/<run_id>/`.
+
+Typical artifacts include:
+
+- final markdown blog,
+- generated images,
+- SEO metadata JSON,
+- run log JSON,
+- dashboard HTML,
+- artifact manifest metadata.
+
+## Current Entry Points
+
+### Preferred entry point
+
+- `src/main.py`
+
+### Backward-compatible entry point
+
+- `src/research_plus_image_blog.py`
+
+The compatibility wrapper still exposes:
+
+- `run(topic, as_of=None, audience_mode="engineer", execution_mode="balanced")`
+
+## How To Run
+
+From the project root:
+
+```powershell
+python -m src.main
+```
+
+Or from Python:
+
+```python
+from src.main import run
+
+result = run(
+    topic="Inside a Transformer: From Attention to Output Tokens",
+    audience_mode="engineer",
+    execution_mode="balanced",
+)
+
+print(result["output_path"])
+```
+
+You can also call the compatibility wrapper:
+
+```python
+from src.research_plus_image_blog import run
+```
+
+## Required Environment
+
+This project expects API keys through environment variables.
+
+Common ones used by the pipeline:
+
+- `GOOGLE_API_KEY`
+- `GROQ_API_KEY`
+- `TAVILY_API_KEY`
+
+The system can fall back across providers when available, but at least one supported text model provider must be configured for full runs.
+
+## Design Intent
+
+This project is no longer just a simple script that writes a blog.
+
+It is intended to be:
+
+- modular,
+- inspectable,
+- easier to extend,
+- easier to test,
+- more robust under partial provider failure,
+- suitable for future production features.
+
+## If We Continue Work Later
+
+If someone picks this up later, the safest places to start are:
+
+1. `src/graph/main_graph.py`
+2. `src/graph/state.py`
+3. `src/agents/`
+4. `src/models/llm_factory.py`
+5. `src/observability/`
+
+These files explain the actual runtime behavior much better than the legacy files.

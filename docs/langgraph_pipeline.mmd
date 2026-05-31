@@ -1,0 +1,41 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	router(router)
+	audience_adapter(audience_adapter)
+	research(research)
+	citation_enricher(citation_enricher)
+	orchestrator(orchestrator)
+	persona(persona)
+	worker_pipeline(worker_pipeline)
+	reducer(reducer)
+	humanizer(humanizer)
+	seo_optimizer(seo_optimizer)
+	image_pipeline(image_pipeline)
+	quality_scoring(quality_scoring)
+	export(export)
+	dashboard(dashboard)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> router;
+	audience_adapter -.-> citation_enricher;
+	audience_adapter -.-> research;
+	citation_enricher --> orchestrator;
+	export --> dashboard;
+	humanizer --> seo_optimizer;
+	image_pipeline --> quality_scoring;
+	orchestrator --> persona;
+	persona -.-> worker_pipeline;
+	quality_scoring --> export;
+	reducer --> humanizer;
+	research --> citation_enricher;
+	router --> audience_adapter;
+	seo_optimizer --> image_pipeline;
+	worker_pipeline --> reducer;
+	dashboard --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
